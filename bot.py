@@ -1,4 +1,3 @@
-
 import os
 import re
 import time
@@ -41,68 +40,66 @@ load_dotenv()  # Load BOT_TOKEN from a local .env file
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# Render (and similar free hosting platforms) only allow *Web Services*
-# on the free tier, and a Web Service must bind to a port so Render's
-# health check passes. This env var is automatically set by Render;
-# it will be absent when running locally in Pydroid 3, in which case
-# the keep-alive server below simply never starts.
+# Render sets PORT automatically for Web Services.
 PORT = os.getenv("PORT")
 
 # Folder where media is temporarily downloaded before being sent
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# Telegram bot API upload limit for standard (non-local) servers is 50 MB.
-# Files bigger than SAFE_UPLOAD_SIZE are automatically split into parts of
-# roughly SPLIT_TARGET_SIZE each (a bit of headroom because parts cut
-# without re-encoding never come out at exactly the requested size).
+# Telegram bot API upload limit is 50 MB.
 SAFE_UPLOAD_SIZE = 49 * 1024 * 1024   # anything above this gets split
 SPLIT_TARGET_SIZE = 44 * 1024 * 1024  # target size of each part
 
-# Longest YouTube video (in minutes) the bot will accept. Free hosting has
-# limited disk/CPU, so very long videos are refused. Override on Render
-# with an environment variable named MAX_VIDEO_MINUTES.
+# Longest YouTube video (in minutes) the bot will accept.
 MAX_DURATION_SECONDS = int(os.getenv("MAX_VIDEO_MINUTES", "120")) * 60
 
-# How many downloads may run at the same time (free plan = small CPU/RAM)
+# How many downloads may run at the same time
 DOWNLOAD_SLOTS = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2")))
 
-# Large uploads need generous timeouts (python-telegram-bot's defaults of
-# a few seconds would abort a big upload).
+# Large uploads need generous timeouts
 UPLOAD_TIMEOUTS = dict(read_timeout=600, write_timeout=600, connect_timeout=30, pool_timeout=30)
 
 # How often (in seconds) the progress message is allowed to be edited.
-# Telegram rate-limits message edits, so we throttle updates.
 PROGRESS_EDIT_INTERVAL = 3
 
-# Many "Lite" app share links (Facebook Lite, TikTok Lite, mobile
-# Instagram) get blocked or served a stripped-down page when requests
-# arrive without a normal desktop browser User-Agent. Sending one makes
-# extraction far more reliable.
 DESKTOP_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Optional cookies file (Netscape format, exported from a logged-in
-# browser session) placed next to bot.py. Instagram and Facebook
-# increasingly require a logged-in session to view Reels/videos, even
-# ones that are technically public. If this file exists it is used
-# automatically; if not, the bot just proceeds without it (some public
-# content will still work fine without cookies).
-SECRET_COOKIES = Path("/etc/secrets/cookies.txt")
-if SECRET_COOKIES.exists():
-    shutil.copy2(SECRET_COOKIES, COOKIES_FILE)
+# ---------------------------------------------------------------------
+# COOKIES
+# ---------------------------------------------------------------------
+# YouTube blocks datacenter IPs (like Render) unless a logged-in
+# cookies.txt is supplied. The cookies are NEVER written in this file.
+# Provide them on Render in ONE of these ways:
+#   1) Secret File named  cookies.txt   (best; lands in /etc/secrets/)
+#   2) Environment variable named  COOKIES_TXT  (whole file contents)
+COOKIES_FILE = Path("cookies.txt")
+
+
+def _prepare_cookies() -> None:
+    """Create ./cookies.txt from a Render Secret File or COOKIES_TXT env var."""
+    secret = Path("/etc/secrets/cookies.txt")
+    env_text = os.getenv("COOKIES_TXT", "").strip()
+    try:
+        if secret.exists():
+            shutil.copy2(secret, COOKIES_FILE)
+        elif env_text:
+            COOKIES_FILE.write_text(env_text.replace("\\n", "\n") + "\n", encoding="utf-8")
+    except Exception as exc:
+        print(f"Could not prepare cookies: {exc}")
+
+
+_prepare_cookies()
 
 
 def _setup_ffmpeg() -> Path | None:
     """
     Locate ffmpeg (needed to merge HD video+audio streams and to split big
     files). Uses a system ffmpeg if present, otherwise the static binary
-    shipped by the `imageio-ffmpeg` pip package -- this works on Render's
-    free plan where you can't apt-install anything. Returns None when no
-    ffmpeg can be found (the bot then falls back to single-file formats and
-    cannot split large files).
+    shipped by the `imageio-ffmpeg` pip package.
     """
     exe = shutil.which("ffmpeg")
     if not exe:
@@ -111,8 +108,6 @@ def _setup_ffmpeg() -> Path | None:
             exe = imageio_ffmpeg.get_ffmpeg_exe()
         except Exception:
             return None
-    # yt-dlp looks for a binary literally named "ffmpeg", so expose it
-    # under that name in a local folder.
     bin_dir = Path("bin")
     bin_dir.mkdir(exist_ok=True)
     link = bin_dir / "ffmpeg"
@@ -133,31 +128,26 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-# Silence overly chatty libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("MediaDownloaderBot")
+
+if COOKIES_FILE.exists():
+    logger.info("cookies.txt found (%d bytes) - will be used by yt-dlp", COOKIES_FILE.stat().st_size)
+else:
+    logger.info("No cookies.txt found - YouTube may block this server")
 
 
 # =====================================================================
 # PLATFORM DETECTION
 # =====================================================================
 
-# Regex patterns used to recognize which platform a link belongs to.
-# These are used only for display purposes ("Detected: YouTube" etc.)
-# yt-dlp itself decides internally whether it can actually extract media.
 PLATFORM_PATTERNS = {
     "YouTube": re.compile(r"(youtube\.com|youtu\.be)", re.IGNORECASE),
-    # Instagram share links are the same domain regardless of the app
-    # (regular or Lite), so a single pattern covers both.
     "Instagram": re.compile(r"instagram\.com", re.IGNORECASE),
-    # Facebook Lite / mobile shares commonly use m., mbasic., web., or
-    # the fb.watch short-link domain instead of plain facebook.com.
     "Facebook": re.compile(
         r"((m|mbasic|web|touch|beta)\.facebook\.com|facebook\.com|fb\.watch)",
         re.IGNORECASE,
     ),
-    # TikTok Lite shares are frequently shortened links on vm./vt./m.
-    # subdomains rather than the full www.tiktok.com URL.
     "TikTok": re.compile(r"((vm|vt|m)\.tiktok\.com|tiktok\.com)", re.IGNORECASE),
     "X (Twitter)": re.compile(r"(twitter\.com|x\.com)", re.IGNORECASE),
     "Threads": re.compile(r"threads\.net", re.IGNORECASE),
@@ -166,20 +156,13 @@ PLATFORM_PATTERNS = {
     "WhatsApp": re.compile(r"whatsapp\.(com|net)", re.IGNORECASE),
 }
 
-# Short/redirect-style link domains that need to be resolved to their
-# final canonical URL before being handed to yt-dlp. "Lite" versions of
-# apps (Facebook Lite, TikTok Lite) frequently generate share links on
-# these shortened domains, and yt-dlp's extractors sometimes expect the
-# fully-resolved URL rather than the short one.
 REDIRECT_DOMAINS = re.compile(
     r"(vm\.tiktok\.com|vt\.tiktok\.com|fb\.watch|mbasic\.facebook\.com)",
     re.IGNORECASE,
 )
 
-# A generic URL matcher used to pull the first link out of any message
 URL_REGEX = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
 
-# File extensions considered "direct media" for the raw-download fallback
 DIRECT_MEDIA_EXTENSIONS = (
     ".mp4", ".mov", ".mkv", ".webm", ".3gp",
     ".jpg", ".jpeg", ".png", ".gif", ".webp",
@@ -204,16 +187,7 @@ def extract_url(text: str) -> str | None:
 
 
 async def resolve_redirect(url: str) -> str:
-    """
-    Follow short/redirect links (e.g. vm.tiktok.com, fb.watch,
-    mbasic.facebook.com) to their final canonical URL.
-
-    "Lite" apps (Facebook Lite, TikTok Lite) very often generate these
-    shortened share links, and some extractors fail on the short form
-    even though they work fine once the link is resolved. If anything
-    goes wrong here we simply fall back to the original URL so the
-    download attempt can still proceed.
-    """
+    """Follow short/redirect links to their final canonical URL."""
     if not REDIRECT_DOMAINS.search(url):
         return url
 
@@ -237,12 +211,7 @@ async def resolve_redirect(url: str) -> str:
 # =====================================================================
 
 class ProgressState:
-    """
-    Small thread-safe-ish container used to pass download progress
-    from yt-dlp's synchronous progress_hook (which runs in a worker
-    thread) to the async task that periodically edits the Telegram
-    status message.
-    """
+    """Passes download progress from yt-dlp's thread to the async updater."""
 
     def __init__(self):
         self.percent: float = 0.0
@@ -252,7 +221,6 @@ class ProgressState:
         self.filename: str = ""
 
     def update_from_ytdlp(self, d: dict) -> None:
-        """Called synchronously by yt-dlp on its download thread."""
         status = d.get("status")
         if status == "downloading":
             self.status = "downloading"
@@ -284,10 +252,7 @@ async def progress_updater(
     platform: str,
     stop_event: asyncio.Event,
 ) -> None:
-    """
-    Background task that periodically edits the status message with
-    the latest download progress until `stop_event` is set.
-    """
+    """Periodically edits the status message until `stop_event` is set."""
     last_text = ""
     while not stop_event.is_set():
         try:
@@ -308,7 +273,6 @@ async def progress_updater(
                 await message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
                 last_text = text
         except TelegramError:
-            # Ignore "message not modified" and transient edit failures
             pass
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("Progress updater non-fatal error: %s", exc)
@@ -332,16 +296,10 @@ def _base_ydl_opts() -> dict:
         "restrictfilenames": True,
         "retries": 5,
         "socket_timeout": 30,
-        # A normal desktop User-Agent avoids the stripped-down / blocked
-        # responses that "Lite" app share links (Facebook Lite, TikTok
-        # Lite, mobile Instagram) sometimes trigger.
         "http_headers": {"User-Agent": DESKTOP_USER_AGENT},
         "extractor_retries": 3,
     }
-    # If the user has provided a browser-exported cookies.txt, use it.
-    # Needed for Instagram/Facebook Reels, and very often for YouTube too
-    # when the bot runs on a datacenter IP (Render) -- YouTube then asks
-    # "Sign in to confirm you're not a bot".
+    # Use the logged-in cookies if available (needed on Render for YouTube).
     if COOKIES_FILE.exists():
         opts["cookiefile"] = str(COOKIES_FILE)
     return opts
@@ -352,9 +310,7 @@ def build_format(quality: str) -> str:
     Turn a quality choice into a yt-dlp format selector.
       "audio"   -> audio only
       "360"...  -> best video up to that height (+ best audio)
-      "auto"    -> best single pre-merged file (original behaviour)
-    HD YouTube streams come as separate video + audio files, so merging
-    them needs ffmpeg. Without ffmpeg we fall back to single-file formats.
+      "auto"    -> best single pre-merged file
     """
     if quality == "audio":
         return "bestaudio[ext=m4a]/bestaudio/best"
@@ -382,11 +338,7 @@ def _extract_info(url: str) -> dict:
 def _run_ytdlp_download(
     url: str, out_dir: Path, state: ProgressState, quality: str = "auto"
 ) -> tuple[Path, float | None]:
-    """
-    Blocking function that performs the actual yt-dlp download.
-    Must be executed inside a worker thread via asyncio.to_thread().
-    Returns (path to the downloaded file, duration in seconds or None).
-    """
+    """Blocking yt-dlp download. Returns (file path, duration or None)."""
     ydl_opts = {
         **_base_ydl_opts(),
         "format": build_format(quality),
@@ -402,8 +354,6 @@ def _run_ytdlp_download(
         if "entries" in info and info["entries"]:
             info = info["entries"][0]
 
-        # After a merge the real file can have a different extension than
-        # prepare_filename() predicts, so prefer the path yt-dlp reports.
         path = None
         downloads = info.get("requested_downloads") or []
         if downloads and downloads[0].get("filepath"):
@@ -425,14 +375,9 @@ async def download_via_ytdlp(
 
 
 async def download_direct_link(url: str, out_dir: Path, state: ProgressState) -> Path:
-    """
-    Fallback downloader for plain direct media links (used for WhatsApp
-    media links, public Snapchat CDN links, or any raw file URL that
-    yt-dlp does not recognize as a supported site).
-    """
+    """Fallback downloader for plain direct media links."""
     state.status = "downloading"
 
-    # Derive a reasonably sensible filename from the URL
     name_guess = url.split("?")[0].rstrip("/").split("/")[-1] or "file"
     if "." not in name_guess:
         name_guess += ".bin"
@@ -462,7 +407,6 @@ async def is_direct_media_url(url: str) -> bool:
     lowered = url.split("?")[0].lower()
     if lowered.endswith(DIRECT_MEDIA_EXTENSIONS):
         return True
-    # Try a lightweight HEAD request to inspect the content type
     try:
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -476,16 +420,7 @@ async def is_direct_media_url(url: str) -> bool:
 async def download_media(
     url: str, out_dir: Path, state: ProgressState, quality: str = "auto"
 ) -> tuple[Path, float | None]:
-    """
-    Master download dispatcher. Returns (file path, duration or None).
-    Tries yt-dlp first (covers YouTube, Instagram, Facebook, TikTok,
-    X/Twitter, Threads, Likee, Snapchat public posts). Falls back to a
-    plain HTTP downloader for direct file links (e.g. WhatsApp media
-    links, raw CDN URLs).
-    """
-    # "Lite" apps (Facebook Lite, TikTok Lite) often generate shortened
-    # share links (vm.tiktok.com, fb.watch, mbasic.facebook.com). Resolve
-    # those to their final URL first.
+    """Master download dispatcher. Returns (file path, duration or None)."""
     url = await resolve_redirect(url)
 
     try:
@@ -504,13 +439,14 @@ def friendly_download_error(exc: Exception) -> Exception:
     if "not a bot" in text or "sign in to confirm" in text:
         return RuntimeError(
             "YouTube is blocking this server ('confirm you're not a bot'). "
-            "Add a browser-exported 'cookies.txt' next to bot.py to fix this."
+            "Your cookies may be missing or expired - export a fresh "
+            "cookies.txt and update the Render Secret File."
         )
     if "login" in text or "rate-limit" in text or "private" in text:
         return RuntimeError(
             "This content requires a logged-in session to access (common for "
             "Instagram/Facebook Reels). Add a browser-exported 'cookies.txt' "
-            "file next to bot.py to enable access to this kind of link."
+            "as a Render Secret File to enable access to this kind of link."
         )
     return exc
 
@@ -592,9 +528,7 @@ def _ffmpeg_duration(path: Path) -> float | None:
 def split_file(path: Path, out_dir: Path, duration: float | None = None) -> list[Path]:
     """
     Blocking: split a media file into parts that each fit under Telegram's
-    50 MB bot upload limit. Uses `-c copy` (no re-encoding), so it is fast
-    and lossless, and each part plays on its own. Cuts land on keyframes,
-    so if any part still comes out too big we retry with shorter segments.
+    50 MB bot upload limit, using `-c copy` (no re-encoding).
     """
     size = path.stat().st_size
     if size <= SAFE_UPLOAD_SIZE:
@@ -631,7 +565,7 @@ def split_file(path: Path, out_dir: Path, duration: float | None = None) -> list
         if all(p.stat().st_size <= SAFE_UPLOAD_SIZE for p in parts):
             path.unlink(missing_ok=True)  # free disk space
             return parts
-        seg_seconds *= 0.75  # some part was too big -> use shorter segments
+        seg_seconds *= 0.75
 
     raise RuntimeError("Could not split the file into parts small enough for Telegram.")
 
@@ -696,7 +630,6 @@ def main_keyboard() -> InlineKeyboardMarkup:
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the /start command with a beautiful welcome message."""
     await update.message.reply_text(
         WELCOME_MESSAGE,
         parse_mode=ParseMode.MARKDOWN,
@@ -706,7 +639,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the /help command."""
     await update.message.reply_text(HELP_MESSAGE, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -748,8 +680,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def ask_quality(message, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
     """
     For regular (long) YouTube videos: look up the video, then let the user
-    pick a quality. Big files are split into parts automatically, so even
-    hour-long videos work -- lower quality simply means fewer parts.
+    pick a quality. Big files are split into parts automatically.
     """
     status = await message.reply_text("🔎 Fetching video info...")
     try:
@@ -772,7 +703,6 @@ async def ask_quality(message, context: ContextTypes.DEFAULT_TYPE, url: str) -> 
         )
         return
 
-    # Only offer heights the video actually has (always at least one)
     heights_available = [f["height"] for f in info.get("formats") or [] if f.get("height")]
     max_height = max(heights_available) if heights_available else 10_000
     offered = [h for h in QUALITY_HEIGHTS if h <= max_height] or [QUALITY_HEIGHTS[0]]
@@ -818,7 +748,6 @@ async def process_download(
     quality: str = "auto",
 ) -> None:
     """Download `url`, split it if it is too big, and upload it to the chat."""
-    # Unique working folder per request to avoid filename collisions
     job_dir = DOWNLOAD_DIR / f"{chat_id}_{int(time.time() * 1000)}"
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -833,14 +762,12 @@ async def process_download(
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
             file_path, duration = await download_media(url, job_dir, state, quality)
 
-        # Stop the progress updater now that the download has finished
         stop_event.set()
         await updater_task
 
         if not file_path.exists():
             raise FileNotFoundError("Downloaded file could not be located on disk.")
 
-        # Too big for one Telegram upload? Cut it into parts.
         if file_path.stat().st_size > SAFE_UPLOAD_SIZE:
             await status_message.edit_text(
                 "✂️ *Large file — splitting into parts...*", parse_mode=ParseMode.MARKDOWN
@@ -886,7 +813,6 @@ async def process_download(
                 await updater_task
             except Exception:
                 pass
-        # Clean up downloaded files to save storage space
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
@@ -894,7 +820,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """
     Main message handler: finds a link in the incoming message.
     Regular YouTube videos -> ask for a quality first.
-    Everything else (Shorts, Reels, TikTok, ...) -> download straight away.
+    Everything else -> download straight away.
     """
     message = update.message
     if message is None or not message.text:
@@ -936,41 +862,22 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # =====================================================================
 # KEEP-ALIVE WEB SERVER (for Render's free Web Service tier)
 # =====================================================================
-#
-# Render's free plan only supports "Web Services", which must respond
-# on a port for Render's health check to consider the deploy healthy.
-# Our bot itself only does Telegram polling and doesn't need a port --
-# so this tiny HTTP server exists purely to satisfy that requirement.
-#
-# It does nothing but reply "OK" to any GET request. Pair this with an
-# external uptime pinger (e.g. UptimeRobot / cron-job.org) hitting the
-# service URL every 5-10 minutes so Render doesn't spin it down after
-# 15 minutes of inactivity.
-#
-# This block is inert when PORT is not set (e.g. running locally on
-# Pydroid 3), so it never interferes with normal local use.
 
 class _KeepAliveHandler(BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802 (required method name from base class)
+    def do_GET(self):  # noqa: N802
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"Bot is alive and running.")
 
     def log_message(self, format, *args):  # noqa: A002
-        # Silence the default per-request console logging (keep-alive
-        # pings would otherwise spam the log every few minutes).
         pass
 
 
 def start_keep_alive_server() -> None:
-    """
-    Start the keep-alive HTTP server in a background daemon thread if
-    a PORT has been provided by the hosting platform (Render sets this
-    automatically for Web Services).
-    """
+    """Start the keep-alive HTTP server if a PORT has been provided."""
     if not PORT:
-        return  # Not running on Render (or similar) -- nothing to do
+        return
 
     def _serve():
         server = HTTPServer(("0.0.0.0", int(PORT)), _KeepAliveHandler)
@@ -993,8 +900,6 @@ def build_application() -> Application:
             "    BOT_TOKEN=your_telegram_bot_token_here"
         )
 
-    # concurrent_updates lets other users keep using the bot while a long
-    # download/upload is running (otherwise everyone waits in one queue).
     app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", start_command))
