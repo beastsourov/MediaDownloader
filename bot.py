@@ -90,7 +90,9 @@ DESKTOP_USER_AGENT = (
 # ones that are technically public. If this file exists it is used
 # automatically; if not, the bot just proceeds without it (some public
 # content will still work fine without cookies).
-COOKIES_FILE = Path("cookies.txt")
+SECRET_COOKIES = Path("/etc/secrets/cookies.txt")
+if SECRET_COOKIES.exists():
+    shutil.copy2(SECRET_COOKIES, COOKIES_FILE)
 
 
 def _setup_ffmpeg() -> Path | None:
