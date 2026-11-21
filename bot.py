@@ -1373,9 +1373,17 @@ def build_application() -> Application:
     return app
 
 
+def log_startup_checks() -> None:
+    """Print what is installed, so problems are obvious in the Render logs."""
+    logger.info("gallery-dl (photo posts): %s", "installed" if GALLERY_DL_OK else "NOT INSTALLED - add gallery-dl to requirements.txt")
+    logger.info("ffmpeg (HD merge / splitting): %s", FFMPEG_EXE if FFMPEG_EXE else "NOT FOUND - add imageio-ffmpeg to requirements.txt")
+    logger.info("yt-dlp version: %s", yt_dlp.version.__version__)
+
+
 def main() -> None:
     """Entry point: build the bot and start polling for updates."""
     logger.info("Starting Telegram Universal Media Downloader Bot...")
+    log_startup_checks()
     start_keep_alive_server()
     application = build_application()
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
