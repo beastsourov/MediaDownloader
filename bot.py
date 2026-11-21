@@ -687,12 +687,19 @@ _AUTH_HINTS = re.compile(
 )
 
 
-def pick_error(errors: list[Exception]) -> Exception:
-    """The most useful error to show: a login/cookie problem if there was one."""
-    for exc in errors:
+def pick_error(errors: list[tuple[str, Exception]]) -> Exception:
+    """
+    The most useful error to show. Priority: a login/cookie problem, then
+    anything reported by gallery-dl / the Threads reader (yt-dlp's own
+    "No video formats found" is just noise for photo posts), then the last.
+    """
+    for _name, exc in errors:
         if _AUTH_HINTS.search(str(exc)):
             return exc
-    return errors[-1]
+    for name, exc in errors:
+        if name != "use_ytdlp":
+            return exc
+    return errors[-1][1]
 
 
 async def download_media(
@@ -726,7 +733,12 @@ async def download_media(
         else:
             attempts.append(use_gallery_dl)
 
-    errors: list[Exception] = []
+    errors: list[tuple[str, Exception]] = []
+    if platform in GALLERY_DL_PLATFORMS and not GALLERY_DL_OK:
+        errors.append(("missing_gallery_dl", RuntimeError(
+            "Photo posts need the 'gallery-dl' package, which is not installed. "
+            "Add `gallery-dl` to requirements.txt and redeploy."
+        )))
     for attempt in attempts:
         _clear_dir(out_dir)  # drop leftovers of a failed attempt
         state.status = "starting"
@@ -735,7 +747,7 @@ async def download_media(
             return await attempt()
         except Exception as exc:
             logger.info("%s failed for %s: %s", attempt.__name__, url, exc)
-            errors.append(exc)
+            errors.append((attempt.__name__, exc))
 
     _clear_dir(out_dir)
     if await is_direct_media_url(url):
@@ -758,6 +770,12 @@ def friendly_download_error(exc: Exception) -> Exception:
             "This content requires a logged-in session to access (common for "
             "Instagram/Facebook posts). Add a browser-exported 'cookies.txt' "
             "as a Render Secret File to enable access to this kind of link."
+        )
+    if "no video formats found" in text or "no video in this post" in text:
+        return RuntimeError(
+            "This post has no video (it is probably a photo post) and the photo "
+            "downloader could not fetch it. Instagram usually needs a logged-in "
+            "'cookies.txt' that contains instagram.com cookies - see the bot setup notes."
         )
     return exc
 
