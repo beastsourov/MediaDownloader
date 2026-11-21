@@ -1,6 +1,6 @@
-python-telegram-bot
+python-telegram-bot>=21.0
 yt-dlp
+gallery-dl
+imageio-ffmpeg
 aiohttp
-requests
 python-dotenv
-Pillow
