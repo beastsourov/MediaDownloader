@@ -1,4 +1,3 @@
-
 import os
 import re
 import sys
@@ -81,6 +80,9 @@ UPLOAD_TIMEOUTS = dict(read_timeout=600, write_timeout=600, connect_timeout=30, 
 # Telegram rate-limits message edits, so we throttle updates.
 PROGRESS_EDIT_INTERVAL = 3
 
+# Quality of the MP3 files created by the "Audio only" option (kbps).
+AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "192")
+
 # Many "Lite" app share links (Facebook Lite, TikTok Lite, mobile
 # Instagram) get blocked or served a stripped-down page when requests
 # arrive without a normal desktop browser User-Agent. Sending one makes
@@ -122,12 +124,12 @@ _prepare_cookies()
 
 def _setup_ffmpeg() -> Path | None:
     """
-    Locate ffmpeg (needed to merge HD video+audio streams and to split big
-    files). Uses a system ffmpeg if present, otherwise the static binary
-    shipped by the `imageio-ffmpeg` pip package -- this works on Render's
-    free plan where you can't apt-install anything. Returns None when no
-    ffmpeg can be found (the bot then falls back to single-file formats and
-    cannot split large files).
+    Locate ffmpeg (needed to merge HD video+audio streams, to convert audio
+    to MP3 and to split big files). Uses a system ffmpeg if present,
+    otherwise the static binary shipped by the `imageio-ffmpeg` pip package
+    -- this works on Render's free plan where you can't apt-install
+    anything. Returns None when no ffmpeg can be found (the bot then falls
+    back to single-file formats and cannot split large files).
     """
     exe = shutil.which("ffmpeg")
     if not exe:
@@ -299,6 +301,11 @@ class ProgressState:
         elif status == "error":
             self.status = "error"
 
+    def update_from_postprocessor(self, d: dict) -> None:
+        """Called by yt-dlp while merging video+audio or converting to MP3."""
+        if d.get("status") == "started":
+            self.status = "processing"
+
 
 def make_progress_bar(percent: float, width: int = 18) -> str:
     """Render a simple text-based progress bar."""
@@ -328,7 +335,7 @@ async def progress_updater(
                     f"Speed: `{state.speed or 'N/A'}`  |  ETA: `{state.eta or 'N/A'}`"
                 )
             elif state.status == "processing":
-                text = "⚙️ *Processing video...*"
+                text = "⚙️ *Processing (merging / converting)...*"
             elif state.status == "finished":
                 text = f"✅ *Download complete!* Preparing to upload...\n\n`{make_progress_bar(100)}`"
             else:
@@ -380,23 +387,30 @@ def _base_ydl_opts() -> dict:
 def build_format(quality: str) -> str:
     """
     Turn a quality choice into a yt-dlp format selector.
-      "audio"   -> audio only
-      "360"...  -> best video up to that height (+ best audio)
-      "auto"    -> best single pre-merged file (original behaviour)
-    HD YouTube streams come as separate video + audio files, so merging
-    them needs ffmpeg. Without ffmpeg we fall back to single-file formats.
+      "audio"   -> best audio only (converted to MP3 afterwards)
+      "360"..."1080" -> best video up to that height + best audio (merged)
+      "auto"    -> best available video + audio
+    HD YouTube streams (720p / 1080p) come as separate video + audio files,
+    so merging them needs ffmpeg. Without ffmpeg we fall back to
+    single-file formats (usually max 360p / 720p).
+    H.264 (avc1) video is preferred because Telegram plays it everywhere.
     """
     if quality == "audio":
+        if FFMPEG_EXE:
+            return "bestaudio/best"
         return "bestaudio[ext=m4a]/bestaudio/best"
     if quality.isdigit():
         h = int(quality)
         if FFMPEG_EXE:
             return (
-                f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]"
+                f"bv*[height<={h}][vcodec^=avc1]+ba[ext=m4a]"
+                f"/bv*[height<={h}][ext=mp4]+ba[ext=m4a]"
                 f"/bv*[height<={h}]+ba"
                 f"/b[height<={h}][ext=mp4]/b[height<={h}]/best"
             )
         return f"b[height<={h}][ext=mp4]/b[height<={h}]/best"
+    if FFMPEG_EXE:
+        return "bv*+ba/b"
     return "best[ext=mp4]/best"
 
 
@@ -456,11 +470,24 @@ def _run_ytdlp_download(
         "format": build_format(quality),
         "outtmpl": str(out_dir / "%(title).60s_%(id)s.%(ext)s"),
         "progress_hooks": [state.update_from_ytdlp],
+        "postprocessor_hooks": [state.update_from_postprocessor],
         "playlist_items": f"1-{MAX_POST_FILES}",
     }
     if FFMPEG_EXE:
         ydl_opts["ffmpeg_location"] = str(FFMPEG_EXE.parent)
         ydl_opts["merge_output_format"] = "mp4"
+
+    if quality == "audio":
+        # Nice file name (the song/video title) so it shows up properly
+        # in the Telegram music player.
+        ydl_opts["outtmpl"] = str(out_dir / "%(title).80s.%(ext)s")
+        ydl_opts["restrictfilenames"] = False
+        if FFMPEG_EXE:
+            ydl_opts["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": AUDIO_BITRATE,
+            }]
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -784,7 +811,8 @@ def friendly_download_error(exc: Exception) -> Exception:
 # LONG VIDEO SUPPORT: SIZE ESTIMATES + SPLITTING INTO TELEGRAM-SIZED PARTS
 # =====================================================================
 
-QUALITY_HEIGHTS = (360, 480, 720)
+# Video qualities offered in the menu (only those the video really has)
+QUALITY_HEIGHTS = (360, 480, 720, 1080)
 
 
 def is_youtube_short(url: str) -> bool:
@@ -823,6 +851,9 @@ def estimate_size(info: dict, quality: str) -> int | None:
     best_audio = max(audio_sizes) if audio_sizes else 0
 
     if quality == "audio":
+        if FFMPEG_EXE and duration:
+            # MP3 size is predictable: bitrate x duration
+            return int(int(AUDIO_BITRATE) * 1000 / 8 * duration)
         return best_audio or None
 
     h = int(quality)
@@ -936,7 +967,11 @@ async def _send_single(bot, chat_id: int, path: Path, caption: str | None) -> No
             elif kind == "video":
                 await bot.send_video(chat_id, media_file, supports_streaming=True, **kwargs)
             elif kind == "audio":
-                await bot.send_audio(chat_id, media_file, **kwargs)
+                # The title shows in Telegram's music player
+                await bot.send_audio(
+                    chat_id, media_file,
+                    title=path.stem[:64], filename=path.name, **kwargs
+                )
             elif kind == "animation":
                 await bot.send_animation(chat_id, media_file, **kwargs)
             else:
@@ -975,7 +1010,7 @@ async def deliver_files(
 ) -> None:
     """
     Send downloaded files to the chat. Several photos/videos of one post go
-    out as albums; videos over 50MB are split into parts first.
+    out as albums; videos/audio over 50MB are split into parts first.
     """
     base_caption = f"✅ Downloaded from *{platform}*"
 
@@ -1045,7 +1080,9 @@ async def deliver_files(
 WELCOME_MESSAGE = (
     "👋 *Welcome to the Universal Media Downloader Bot!*\n\n"
     "Send me a link from any of the platforms below and I'll fetch the "
-    "highest quality media for you, straight into this chat. 🎬📥\n\n"
+    "media for you, straight into this chat. 🎬📥\n\n"
+    "🎬 Choose video quality: 360p / 480p / 720p / 1080p (with sound)\n"
+    "🎵 Or download only the audio as an MP3 file\n\n"
     "*Supported platforms:*\n"
     "▫️ YouTube (Long videos & Shorts)\n"
     "▫️ Instagram (Reels, Posts & Photos)\n"
@@ -1063,10 +1100,11 @@ HELP_MESSAGE = (
     "🛠 *How to use this bot:*\n\n"
     "1️⃣ Copy a link from any supported platform.\n"
     "2️⃣ Paste it here in the chat.\n"
-    "3️⃣ Wait while I download it — you'll see a live progress bar.\n"
-    "4️⃣ Receive your media file right here!\n\n"
+    "3️⃣ Pick *Video* (360p–1080p, with sound) or *Audio only (MP3)*.\n"
+    "4️⃣ Wait while I download it — you'll see a live progress bar.\n"
+    "5️⃣ Receive your file right here!\n\n"
     "🖼 *Photos:* Instagram / TikTok / X photo posts and carousels (photos + videos) are sent as albums.\n"
-    "🎬 *YouTube:* you can pick 360p / 480p / 720p or audio only.\n"
+    "🎵 *Audio:* converted to MP3 so it plays in Telegram's music player.\n"
     "📦 Telegram bots can only upload 50MB per file, so bigger videos are "
     "automatically split into several parts (lower quality = fewer parts)."
 )
@@ -1129,15 +1167,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.message.edit_text("⏳ Preparing download...")
         await process_download(
             context, query.message.chat_id, query.message,
-            request["url"], "YouTube", quality,
+            request["url"], request.get("platform", "YouTube"), quality,
         )
+
+
+def _store_pending(context: ContextTypes.DEFAULT_TYPE, url: str, platform: str) -> str:
+    """Remember a link while the user is choosing a quality; returns a token."""
+    token = uuid.uuid4().hex[:8]
+    pending = context.user_data.setdefault("pending", {})
+    while len(pending) >= 20:  # keep memory use small
+        pending.pop(next(iter(pending)))
+    pending[token] = {"url": url, "platform": platform}
+    return token
 
 
 async def ask_quality(message, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
     """
-    For regular (long) YouTube videos: look up the video, then let the user
-    pick a quality. Big files are split into parts automatically, so even
-    hour-long videos work -- lower quality simply means fewer parts.
+    For YouTube links: look up the video, then let the user pick a video
+    quality (360p-1080p) or audio only (MP3). Big files are split into
+    parts automatically, so even hour-long videos work -- lower quality
+    simply means fewer parts.
     """
     status = await message.reply_text("🔎 Fetching video info...")
     try:
@@ -1174,27 +1223,61 @@ async def ask_quality(message, context: ContextTypes.DEFAULT_TYPE, url: str) -> 
             text += f" ({-(-size // SPLIT_TARGET_SIZE)} parts)"
         return text
 
-    token = uuid.uuid4().hex[:8]
-    pending = context.user_data.setdefault("pending", {})
-    while len(pending) >= 20:  # keep memory use small
-        pending.pop(next(iter(pending)))
-    pending[token] = {"url": url}
+    token = _store_pending(context, url, "YouTube")
 
+    # Highest quality first
     rows = [
         [InlineKeyboardButton(label("🎬", f"{h}p", str(h)), callback_data=f"dl|{token}|{h}")]
-        for h in offered
+        for h in reversed(offered)
     ]
-    rows.append([InlineKeyboardButton(label("🎵", "Audio only", "audio"), callback_data=f"dl|{token}|audio")])
+    audio_name = "Audio only (MP3)" if FFMPEG_EXE else "Audio only"
+    rows.append([InlineKeyboardButton(label("🎵", audio_name, "audio"), callback_data=f"dl|{token}|audio")])
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{token}")])
 
     title = escape_markdown(str(info.get("title") or "Video")[:100], version=1)
     await status.edit_text(
         f"🎬 *{title}*\n"
         f"⏱ Duration: `{format_duration(duration)}`\n\n"
-        "Choose a quality. Files over 50MB are sent in several parts.",
+        "Choose video quality (with sound) or audio only.\n"
+        "Files over 50MB are sent in several parts.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(rows),
     )
+
+
+async def ask_simple_menu(message, context: ContextTypes.DEFAULT_TYPE, url: str, platform: str) -> None:
+    """
+    For other video sites (Facebook, TikTok, Instagram Reels, Likee):
+    no lookup needed, just ask whether the user wants the video or only
+    the audio.
+    """
+    token = _store_pending(context, url, platform)
+    audio_name = "Audio only (MP3)" if FFMPEG_EXE else "Audio only"
+    rows = [
+        [InlineKeyboardButton("🎬 Video (best quality, with sound)", callback_data=f"dl|{token}|auto")],
+        [InlineKeyboardButton(f"🎵 {audio_name}", callback_data=f"dl|{token}|audio")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{token}")],
+    ]
+    await message.reply_text(
+        f"🔎 *Detected platform:* {platform}\n\nWhat do you want to download?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+def wants_menu(url: str, platform: str) -> bool:
+    """
+    Should the user be asked "video or audio?" first?
+    Not for photo posts (those just download), only for video-type links.
+    """
+    lowered = url.lower()
+    if platform in ("YouTube", "Facebook", "Likee"):
+        return True
+    if platform == "TikTok":
+        return "/photo/" not in lowered
+    if platform == "Instagram":
+        return "/reel/" in lowered or "/reels/" in lowered
+    return False
 
 
 async def process_download(
@@ -1218,7 +1301,8 @@ async def process_download(
 
     try:
         async with DOWNLOAD_SLOTS:  # limit simultaneous downloads
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+            action = ChatAction.UPLOAD_VOICE if quality == "audio" else ChatAction.UPLOAD_VIDEO
+            await context.bot.send_chat_action(chat_id=chat_id, action=action)
             files, duration = await download_media(url, job_dir, state, quality)
 
         # Stop the progress updater now that the download has finished
@@ -1260,8 +1344,9 @@ async def process_download(
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Main message handler: finds a link in the incoming message.
-    Regular YouTube videos -> ask for a quality first.
-    Everything else (Shorts, Reels, TikTok, ...) -> download straight away.
+    YouTube (videos and Shorts) -> quality menu (360p-1080p / MP3).
+    Other video links (Facebook, TikTok, Reels...) -> "Video or Audio?" menu.
+    Everything else (photo posts, X, Threads...) -> download straight away.
     """
     message = update.message
     if message is None or not message.text:
@@ -1277,8 +1362,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     platform = detect_platform(url)
 
-    if platform == "YouTube" and not is_youtube_short(url):
-        await ask_quality(message, context, url)
+    if wants_menu(url, platform):
+        if platform == "YouTube":
+            await ask_quality(message, context, url)
+        else:
+            await ask_simple_menu(message, context, url, platform)
         return
 
     status_message = await message.reply_text(
@@ -1376,7 +1464,7 @@ def build_application() -> Application:
 def log_startup_checks() -> None:
     """Print what is installed, so problems are obvious in the Render logs."""
     logger.info("gallery-dl (photo posts): %s", "installed" if GALLERY_DL_OK else "NOT INSTALLED - add gallery-dl to requirements.txt")
-    logger.info("ffmpeg (HD merge / splitting): %s", FFMPEG_EXE if FFMPEG_EXE else "NOT FOUND - add imageio-ffmpeg to requirements.txt")
+    logger.info("ffmpeg (HD merge / MP3 / splitting): %s", FFMPEG_EXE if FFMPEG_EXE else "NOT FOUND - add imageio-ffmpeg to requirements.txt")
     logger.info("yt-dlp version: %s", yt_dlp.version.__version__)
 
 
